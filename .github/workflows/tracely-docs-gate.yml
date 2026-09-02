@@ -21,6 +21,10 @@ name: Tracely Docs Gate
 #      Without step 2 the check goes red but merging is still allowed.
 #
 # ESCAPE HATCH: label a PR  no-tracely-docs  to skip the gate.
+#
+# Only runs for PRs targeting the default branch - PRs between two other
+# branches (e.g. test8 -> test7) skip the job entirely, since nothing
+# enforces the gate there anyway.
 # ---------------------------------------------------------------------------
 
 on:
@@ -38,6 +42,10 @@ concurrency:
 
 jobs:
   footprint:
+    # Only the default branch is gated (see branch protection / ruleset note
+    # above), so skip the job entirely for PRs targeting any other branch -
+    # no point burning Actions minutes on a check nothing enforces.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.base.ref == github.event.repository.default_branch
     name: Tracely footprint
     runs-on: ubuntu-latest
     steps:
