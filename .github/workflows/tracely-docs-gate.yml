@@ -137,24 +137,35 @@ String(html || '')
 .replace(/\s+/g, ' ')
 .trim();
 
-// --- 1. Find candidate footprints in the PR description ----------
-// Accepted anywhere in the body, case-insensitive:
+// --- 1. Find candidate footprints in the PR title or description --
+// Accepted in either field, case-insensitive:
 // https://app.tracely.uk/public/documents/<token>
 // https://app.tracely.uk/api/public/pages/<token>
 // Tracely: /public/documents/<token>
-const body = pr.body || '';
+// The title is scanned first, so a link there wins. GitHub fires the
+// 'edited' event for title changes too, so the gate re-runs either way.
 const linkRe = /\/(?:api\/)?public\/(documents|pages)\/([A-Za-z0-9_-]{16,200})/gi;
+const sources = [
+{ where: 'title', text: pr.title || '' },
+{ where: 'description', text: pr.body || '' },
+];
 const candidates = [];
 const seen = new Set();
-for (const m of body.matchAll(linkRe)) {
+for (const source of sources) {
+for (const m of source.text.matchAll(linkRe)) {
 const kind = m[1].toLowerCase();
 const token = m[2];
 const key = kind + '/' + token;
 if (!seen.has(key)) {
 seen.add(key);
-candidates.push({ kind, token });
+candidates.push({ kind, token, where: source.where });
 }
 }
+}
+core.info(
+'Found ' + candidates.length + ' candidate footprint(s): ' +
+(candidates.map((c) => c.kind + ' in PR ' + c.where).join(', ') || 'none')
+);
 
 const sampleHost = appUrl || 'https://app.tracely.uk';
 const helpBlock = [
@@ -162,7 +173,7 @@ const helpBlock = [
 '',
 '1. Open Tracely and write (or update) the doc covering this change.',
 '2. Click **Share** on that document/page to mint a public link.',
-'3. Paste the link anywhere in this PR description, e.g.',
+'3. Paste the link into this PR **title or description**, e.g.',
 '',
 '```',
 'Tracely: ' + sampleHost + '/public/documents/<share-token>',
@@ -212,7 +223,8 @@ core.setFailed(title + ' - ' + detail.replace(/\n/g, ' '));
 if (candidates.length === 0) {
 await fail(
 'No Tracely footprint found in this PR',
-'The PR description must contain a public Tracely share link for the docs covering this change.'
+'Neither the PR title nor the description contains a public Tracely share link. ' +
+'Add one that points at a Tracely doc with real content for this change.'
 );
 return;
 }
@@ -221,9 +233,9 @@ return;
 const problems = [];
 let verified = null;
 
-for (const { kind, token } of candidates) {
+for (const { kind, token, where } of candidates) {
 const url = apiBase + '/api/public/' + kind + '/' + token;
-const short = kind + '/' + token.slice(0, 8) + '...';
+const short = kind + '/' + token.slice(0, 8) + '... (from the PR ' + where + ')';
 core.info('Checking ' + short + ' -> ' + url);
 
 let res;
@@ -307,7 +319,7 @@ continue;
 }
 }
 
-verified = { kind, token, doc, stepCount, embeddedDocs, embeddedSteps, childPages, textLength };
+verified = { kind, token, where, doc, stepCount, embeddedDocs, embeddedSteps, childPages, textLength };
 break;
 }
 
@@ -333,6 +345,7 @@ await upsertComment(
 '### Tracely footprint verified',
 '',
 'Docs: **[' + title + '](' + publicUrl + ')**',
+'Found in the PR ' + verified.where + '.',
 facts.length ? 'Contents: ' + facts.join(', ') + '.' : '',
 verified.doc.updatedAt ? 'Last updated: `' + verified.doc.updatedAt + '`' : '',
 ]
