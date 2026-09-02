@@ -1,0 +1,344 @@
+name: Tracely Docs Gate
+
+# ---------------------------------------------------------------------------
+# DROP-IN FILE. Copy to .github/workflows/tracely-docs-gate.yml in any repo.
+# Nothing in here is repo-specific: it checks out no code and builds nothing.
+#
+# Blocks merging a PR unless the PR description carries a valid "Tracely
+# footprint" - a public Tracely share link that resolves to a real, non-empty
+# Tracely document or page.
+#
+# ONE-TIME SETUP
+# 1. Nothing to configure - it already points at https://app.tracely.uk.
+# Override only if the host changes, via Settings -> Secrets and variables
+# -> Actions -> VARIABLES (not Secrets):
+# TRACELY_API_BASE https://app.tracely.uk
+# TRACELY_APP_URL https://app.tracely.uk
+# 2. Branch protection / Ruleset on the default branch:
+# "Require status checks to pass" -> add Tracely footprint
+# The check name only appears in that picker after this workflow has run
+# once, so open one throwaway PR first.
+# Without step 2 the check goes red but merging is still allowed.
+#
+# ESCAPE HATCH: label a PR no-tracely-docs to skip the gate.
+# ---------------------------------------------------------------------------
+
+on:
+pull_request:
+types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
+workflow_dispatch:
+
+permissions:
+contents: read
+pull-requests: write
+
+concurrency:
+group: tracely-docs-gate-${{ github.event.pull_request.number || github.ref }}
+cancel-in-progress: true
+
+jobs:
+footprint:
+name: Tracely footprint
+runs-on: ubuntu-latest
+steps:
+- name: Verify Tracely footprint
+uses: actions/github-script@v7
+env:
+# Defaults point at the live Tracely install; override with repo/org
+# variables only if you move to a different host.
+TRACELY_API_BASE: ${{ vars.TRACELY_API_BASE || 'https://app.tracely.uk' }}
+TRACELY_APP_URL: ${{ vars.TRACELY_APP_URL || 'https://app.tracely.uk' }}
+# Label that skips the gate.
+SKIP_LABEL: no-tracely-docs
+# 'true' also requires the Tracely doc to point back at this PR
+# (its source URL contains the PR URL, or its title contains #<number>).
+REQUIRE_PR_BACKLINK: 'false'
+# 'true' gates draft PRs too.
+CHECK_DRAFTS: 'false'
+# Minimum real (tag-stripped) characters a Tracely page must carry to
+# count as documented. Ignored when the doc/page has captured steps,
+# embedded documents or sub-pages.
+MIN_DOC_CHARS: '120'
+# Comma-separated path prefixes / extensions. If set, the gate only
+# runs when the PR touches a matching file. Empty = gate every PR.
+# Example: 'src/,api/,migrations/,.sql'
+PATHS_REQUIRING_DOCS: ''
+with:
+script: |
+const COMMENT_MARKER = '<!-- tracely-docs-gate -->';
+const pr = context.payload.pull_request;
+if (!pr) {
+core.info('No pull_request payload - nothing to check.');
+return;
+}
+
+const apiBase = (process.env.TRACELY_API_BASE || '').replace(/\/+$/, '');
+const appUrl = (process.env.TRACELY_APP_URL || '').replace(/\/+$/, '');
+const skipLabel = process.env.SKIP_LABEL || '';
+const requireBacklink = process.env.REQUIRE_PR_BACKLINK === 'true';
+const checkDrafts = process.env.CHECK_DRAFTS === 'true';
+const minChars = Number(process.env.MIN_DOC_CHARS || '120');
+const pathRules = (process.env.PATHS_REQUIRING_DOCS || '')
+.split(',')
+.map((s) => s.trim())
+.filter(Boolean);
+
+// --- 0. Cheap exits ---------------------------------------------
+const labels = (pr.labels || []).map((l) => String(l.name).toLowerCase());
+if (skipLabel && labels.includes(skipLabel.toLowerCase())) {
+core.info('Label "' + skipLabel + '" present - gate skipped.');
+return;
+}
+if (pr.draft && !checkDrafts) {
+core.info('Draft PR - gate skipped until marked ready for review.');
+return;
+}
+
+if (pathRules.length > 0) {
+// Prefix / suffix matching - no glob engine, no escaping traps.
+// 'src/' -> any file under src/
+// '.sql' -> any file ending in .sql
+// 'Dockerfile' -> that exact path, or that basename anywhere
+const needsDocs = (name) =>
+pathRules.some((raw) => {
+const p = raw.replace(/[*]/g, '');
+if (!p) return true;
+if (p.endsWith('/')) return name.startsWith(p);
+if (p.startsWith('.')) return name.endsWith(p);
+return name === p || name.startsWith(p) || name.endsWith('/' + p);
+});
+const files = await github.paginate(github.rest.pulls.listFiles, {
+owner: context.repo.owner,
+repo: context.repo.repo,
+pull_number: pr.number,
+per_page: 100,
+});
+if (!files.some((f) => needsDocs(f.filename))) {
+core.info('No changed file matches PATHS_REQUIRING_DOCS - gate skipped.');
+return;
+}
+}
+
+if (!apiBase) {
+core.setFailed(
+'TRACELY_API_BASE resolved to an empty value. Set it to https://app.tracely.uk under Settings -> Secrets and variables -> Actions -> Variables.'
+);
+return;
+}
+
+// Tracely pages store TipTap HTML. An untouched page serialises to
+// '<p></p>', a non-empty string - so measure real text, not markup.
+const plainTextOf = (html) =>
+String(html || '')
+.replace(/<[^>]*>/g, ' ')
+.replace(/&nbsp;/gi, ' ')
+.replace(/&[a-zA-Z]+;/g, ' ')
+.replace(/&#[0-9]+;/g, ' ')
+.replace(/\s+/g, ' ')
+.trim();
+
+// --- 1. Find candidate footprints in the PR description ----------
+// Accepted anywhere in the body, case-insensitive:
+// https://app.tracely.uk/public/documents/<token>
+// https://app.tracely.uk/api/public/pages/<token>
+// Tracely: /public/documents/<token>
+const body = pr.body || '';
+const linkRe = /\/(?:api\/)?public\/(documents|pages)\/([A-Za-z0-9_-]{16,200})/gi;
+const candidates = [];
+const seen = new Set();
+for (const m of body.matchAll(linkRe)) {
+const kind = m[1].toLowerCase();
+const token = m[2];
+const key = kind + '/' + token;
+if (!seen.has(key)) {
+seen.add(key);
+candidates.push({ kind, token });
+}
+}
+
+const sampleHost = appUrl || 'https://app.tracely.uk';
+const helpBlock = [
+'**How to add the Tracely footprint**',
+'',
+'1. Open Tracely and write (or update) the doc covering this change.',
+'2. Click **Share** on that document/page to mint a public link.',
+'3. Paste the link anywhere in this PR description, e.g.',
+'',
+'```',
+'Tracely: ' + sampleHost + '/public/documents/<share-token>',
+'```',
+'',
+'4. The check re-runs by itself when the description is edited.',
+'',
+'_No doc needed for this PR? Add the `' + skipLabel + '` label._',
+].join('\n');
+
+async function upsertComment(bodyText) {
+const full = COMMENT_MARKER + '\n' + bodyText;
+try {
+const comments = await github.paginate(github.rest.issues.listComments, {
+owner: context.repo.owner,
+repo: context.repo.repo,
+issue_number: pr.number,
+per_page: 100,
+});
+const mine = comments.find((c) => String(c.body || '').includes(COMMENT_MARKER));
+if (mine) {
+await github.rest.issues.updateComment({
+owner: context.repo.owner,
+repo: context.repo.repo,
+comment_id: mine.id,
+body: full,
+});
+} else {
+await github.rest.issues.createComment({
+owner: context.repo.owner,
+repo: context.repo.repo,
+issue_number: pr.number,
+body: full,
+});
+}
+} catch (err) {
+// Fork PRs get a read-only token. The failing check still gates the merge.
+core.warning('Could not write the PR comment: ' + err.message);
+}
+}
+
+async function fail(title, detail) {
+await upsertComment(['### FAILED: ' + title, '', detail, '', helpBlock].join('\n'));
+core.setFailed(title + ' - ' + detail.replace(/\n/g, ' '));
+}
+
+if (candidates.length === 0) {
+await fail(
+'No Tracely footprint found in this PR',
+'The PR description must contain a public Tracely share link for the docs covering this change.'
+);
+return;
+}
+
+// --- 2. Verify each candidate against the Tracely public API -----
+const problems = [];
+let verified = null;
+
+for (const { kind, token } of candidates) {
+const url = apiBase + '/api/public/' + kind + '/' + token;
+const short = kind + '/' + token.slice(0, 8) + '...';
+core.info('Checking ' + short + ' -> ' + url);
+
+let res;
+try {
+res = await fetch(url, { headers: { accept: 'application/json' } });
+} catch (err) {
+problems.push('`' + short + '` - Tracely API unreachable (' + err.message + ').');
+continue;
+}
+
+let payload = null;
+try {
+payload = await res.json();
+} catch (err) {
+payload = null;
+}
+
+// A missing ROUTE yields Fastify's generic 404 (error + statusCode
+// fields). A missing DOC yields Tracely's own message. Different
+// problems, different fixes - do not conflate them.
+if (res.status === 404 && payload && payload.error && payload.statusCode) {
+problems.push(
+'`' + short + '` - the Tracely public API route is missing at ' + apiBase +
+'. That is a deploy/config problem, not a missing doc.'
+);
+continue;
+}
+if (res.status === 404) {
+problems.push('`' + short + '` - not found, or sharing was disabled in Tracely.');
+continue;
+}
+if (!res.ok) {
+problems.push('`' + short + '` - Tracely API returned HTTP ' + res.status + '.');
+continue;
+}
+if (!payload) {
+problems.push('`' + short + '` - Tracely returned a non-JSON response.');
+continue;
+}
+
+const doc = payload;
+
+// How much substance does this doc/page actually carry?
+const stepCount = Array.isArray(doc.items) ? doc.items.length : 0;
+const childPages = Array.isArray(doc.children) ? doc.children.length : 0;
+const embeddedDocs = Array.isArray(doc.documents) ? doc.documents.length : 0;
+const embeddedSteps = Array.isArray(doc.documents)
+? doc.documents.reduce((n, d) => n + (Array.isArray(d.items) ? d.items.length : 0), 0)
+: 0;
+const textLength = plainTextOf(doc.content).length;
+
+const hasContent =
+stepCount > 0 ||
+embeddedSteps > 0 ||
+embeddedDocs > 0 ||
+childPages > 0 ||
+textLength >= minChars;
+
+if (!hasContent) {
+problems.push(
+'**' + (doc.title || short) + '** - the Tracely ' + kind.slice(0, -1) +
+' exists but is empty: ' + textLength + ' characters of text (minimum ' + minChars +
+'), ' + stepCount + ' captured steps, ' + embeddedDocs + ' embedded documents, ' +
+childPages + ' sub-pages. Write the doc before merging.'
+);
+continue;
+}
+
+if (requireBacklink) {
+const haystack = [doc.sourceUrl || '', doc.title || '', doc.description || ''].join(' ');
+const linksBack =
+haystack.includes(pr.html_url) ||
+new RegExp('#' + pr.number + '(?![0-9])').test(haystack) ||
+haystack.includes(context.repo.repo + '/pull/' + pr.number);
+if (!linksBack) {
+problems.push(
+'**' + (doc.title || short) + '** - does not reference this PR. Set the doc source URL to ' +
+pr.html_url + ' or put `#' + pr.number + '` in its title.'
+);
+continue;
+}
+}
+
+verified = { kind, token, doc, stepCount, embeddedDocs, embeddedSteps, childPages, textLength };
+break;
+}
+
+if (!verified) {
+await fail('Tracely footprint is not valid', problems.map((p) => '- ' + p).join('\n'));
+return;
+}
+
+const publicUrl = appUrl
+? appUrl + '/public/' + verified.kind + '/' + verified.token
+: apiBase + '/api/public/' + verified.kind + '/' + verified.token;
+const title = verified.doc.title || verified.token;
+
+const facts = [];
+if (verified.stepCount > 0) facts.push(verified.stepCount + ' captured step(s)');
+if (verified.embeddedDocs > 0) facts.push(verified.embeddedDocs + ' embedded document(s)');
+if (verified.embeddedSteps > 0) facts.push(verified.embeddedSteps + ' embedded step(s)');
+if (verified.childPages > 0) facts.push(verified.childPages + ' sub-page(s)');
+if (verified.textLength > 0) facts.push(verified.textLength + ' characters of text');
+
+await upsertComment(
+[
+'### Tracely footprint verified',
+'',
+'Docs: **[' + title + '](' + publicUrl + ')**',
+facts.length ? 'Contents: ' + facts.join(', ') + '.' : '',
+verified.doc.updatedAt ? 'Last updated: `' + verified.doc.updatedAt + '`' : '',
+]
+.filter(Boolean)
+.join('\n')
+);
+
+core.notice('Tracely footprint verified: ' + publicUrl);
+await core.summary.addHeading('Tracely footprint verified', 3).addLink(title, publicUrl).write();
